@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iiisconnect-agent
+  namespace: weixu
+  labels:
+    app: iiisconnect-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iiisconnect-agent
+  template:
+    metadata:
+      labels:
+        app: iiisconnect-agent
+    spec:
+      containers:
+      - name: agent
+        image: harbor.ai.iiis.co:9443/xuw/lab-cpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          pip install httpx websockets aiofiles --break-system-packages -q 2>/dev/null || \
+          pip install httpx websockets aiofiles -q
+          cd /data/iiisconnect
+          exec python3 -m agent.agent
+        env:
+        - name: IIISCONNECT_GATEWAY_WS
+          value: "wss://iiisconnect.iiis.co:7443/ws/agent"
+        - name: IIISCONNECT_GATEWAY_DATA_WS
+          value: "wss://iiisconnect.iiis.co:7443/ws/data"
+        - name: IIISCONNECT_CACHE_DIR
+          value: "/cache/iiisconnect"
+        - name: IIISCONNECT_DATA_CHANNELS
+          value: "8"
+        - name: IIISCONNECT_AGENT_ID
+          value: "iiis-01"
+        resources:
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: cache
+        persistentVolumeClaim:
+          claimName: gfs-sata-share-pvc-weixu
+      - name: data
+        persistentVolumeClaim:
+          claimName: gfs-nvme-pvc-share-weixu
+      imagePullSecrets:
+      - name: harbor-iiis-registry
