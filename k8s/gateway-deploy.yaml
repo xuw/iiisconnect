@@ -29,15 +29,25 @@ spec:
           pip install fastapi uvicorn[standard] websockets httpx aiofiles -q
           unset http_proxy https_proxy
           cd /data/repos/iiisconnect
-          exec python3 -m uvicorn gateway.server:app --host 0.0.0.0 --port 8000 --ws-max-size 20971520 --log-level info
+          # Start HTTP proxy (port 3128) in background
+          python3 -m gateway.proxy &
+          PROXY_PID=$!
+          # Start main gateway (port 8000)
+          exec python3 -m uvicorn gateway.server:app \
+            --host 0.0.0.0 --port 8000 \
+            --ws-max-size 20971520 --log-level info
         ports:
         - containerPort: 8000
           name: http
+        - containerPort: 3128
+          name: proxy
         env:
         - name: IIISCONNECT_CACHE_DIR
           value: "/data/iiisconnect-cache"
         - name: IIISCONNECT_PORT
           value: "8000"
+        - name: UPSTREAM_PROXY
+          value: "http://192.168.3.226:7890"
         resources:
           limits:
             cpu: "2"
