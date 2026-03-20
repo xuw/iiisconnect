@@ -23,6 +23,7 @@ spec:
         - -c
         - |
           set -e
+          apt-get update -y -q && apt-get install -y rsync openssh-client -q
           pip install httpx websockets aiofiles --break-system-packages -q 2>/dev/null || \
           pip install httpx websockets aiofiles -q
           cd /data/iiisconnect

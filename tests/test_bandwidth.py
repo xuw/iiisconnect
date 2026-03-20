@@ -153,29 +153,37 @@ async def test_single_channel(n_channels: int, test_size_mb: int):
     print(f"\n  Result: {total_bytes / 1e6:.1f} MB in {elapsed:.1f}s → {speed / 1e6:.1f} MB/s")
 
     # Notify completion
-    await control_ws.send(json.dumps({
-        "type": "transfer_complete",
-        "task_id": task_id,
-    }))
+    try:
+        await control_ws.send(json.dumps({
+            "type": "transfer_complete",
+            "task_id": task_id,
+        }))
+    except Exception as e:
+        print(f"  Warning on complete: {e}")
 
     # Cleanup
     for ws in data_ws_list:
-        await ws.close()
-    await control_ws.close()
+        try:
+            await ws.close()
+        except:
+            pass
+    try:
+        await control_ws.close()
+    except:
+        pass
 
     return speed
 
 
 async def main():
     import argparse
+    global GATEWAY_WS, GATEWAY_DATA_WS, TEST_SIZE_MB
     parser = argparse.ArgumentParser(description="IIISConnect Bandwidth Test")
     parser.add_argument("--gateway", default=GATEWAY_WS, help="Gateway WebSocket URL")
     parser.add_argument("--data-ws", default=GATEWAY_DATA_WS, help="Data channel WS base URL")
     parser.add_argument("--size", type=int, default=TEST_SIZE_MB, help="Test data size in MB")
     parser.add_argument("--channels", nargs="+", type=int, default=[1, 4, 8, 16], help="Channel counts to test")
     args = parser.parse_args()
-
-    global GATEWAY_WS, GATEWAY_DATA_WS, TEST_SIZE_MB
     GATEWAY_WS = args.gateway
     GATEWAY_DATA_WS = args.data_ws
     TEST_SIZE_MB = args.size

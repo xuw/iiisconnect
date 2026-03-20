@@ -38,7 +38,7 @@ GATEWAY_DATA_WS_BASE = os.getenv(
 CACHE_DIR = Path(os.getenv("IIISCONNECT_CACHE_DIR", "/cache/iiisconnect"))
 CACHE_MAX_BYTES = int(os.getenv("IIISCONNECT_CACHE_MAX_GB", "5000")) * (1024 ** 3)
 NUM_DATA_CHANNELS = int(os.getenv("IIISCONNECT_DATA_CHANNELS", "8"))
-CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
+CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB
 HEADER_SIZE = 48
 HEARTBEAT_INTERVAL = 10  # seconds
 RECONNECT_DELAY = 5  # seconds
@@ -219,6 +219,80 @@ def cache_evict():
 # ---------------------------------------------------------------------------
 # Smart download
 # ---------------------------------------------------------------------------
+
+async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws) -> bool:
+    ssh_key = "/data/iiisconnect/xuw-aws-jp-2026.pem"
+    ssh_host = "ec2-user@13.208.212.186"
+    
+    if not os.path.exists(ssh_key):
+        log.error(f"AWS relay failed: SSH key {ssh_key} not found")
+        return False
+
+    parsed = urlparse(url)
+    filename = Path(parsed.path).name or "download"
+    remote_tmp = f"/tmp/{task_id}_{filename}"
+    
+    log.info(f"Task {task_id}: Starting AWS relay download to {remote_tmp}")
+    await control_ws.send(json.dumps({
+        "type": "progress", "task_id": task_id, "status": "downloading",
+        "progress": 0, "speed": 0, "source": "aws-relay (remote fetch)"
+    }))
+    
+    # 1. Download on AWS using curl
+    curl_cmd = f"curl -C - -sL -o '{remote_tmp}' '{url}'"
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, curl_cmd]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    await proc.wait()
+    if proc.returncode != 0:
+        log.error(f"Task {task_id}: AWS curl failed with code {proc.returncode}")
+        return False
+        
+    # Get remote size
+    size_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, f"stat -c %s '{remote_tmp}'"]
+    proc_sz = await asyncio.create_subprocess_exec(*size_cmd, stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc_sz.communicate()
+    try:
+        total_size = int(out.decode().strip())
+    except:
+        total_size = 0
+
+    log.info(f"Task {task_id}: AWS fetch done ({total_size} bytes). Rsyncing back.")
+    
+    # 2. Rsync from AWS to local
+    rsync_cmd = [
+        "rsync", "-a", "--append", "--partial", "-e", f"ssh -o StrictHostKeyChecking=no -i {ssh_key}",
+        f"{ssh_host}:{remote_tmp}", str(dest_path)
+    ]
+    start_time = time.time()
+    last_report = start_time
+    
+    proc = await asyncio.create_subprocess_exec(*rsync_cmd)
+    
+    while proc.returncode is None:
+        await asyncio.sleep(2)
+        if total_size > 0 and dest_path.exists():
+            downloaded = dest_path.stat().st_size
+            now = time.time()
+            elapsed = now - start_time
+            speed = downloaded / elapsed if elapsed > 0 else 0
+            progress = int(downloaded * 50 / total_size) if total_size > 0 else 0
+            # AWS relay handles up to 50% progress (the remaining 50% is transfer to Gateway)
+            try:
+                await control_ws.send(json.dumps({
+                    "type": "progress", "task_id": task_id, "status": "downloading",
+                    "progress": progress, "speed": int(speed), "source": "aws-relay (rsync)"
+                }))
+            except:
+                pass
+        
+    await proc.wait()
+    
+    # 3. Clean up remote file
+    rm_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, f"rm -f '{remote_tmp}'"]
+    asyncio.create_task(asyncio.create_subprocess_exec(*rm_cmd))
+    
+    return proc.returncode == 0 and dest_path.exists()
+
 async def download_file(url: str, task_id: str, control_ws) -> Optional[Path]:
     """Download file using smart routing. Returns local path or None."""
 
@@ -258,6 +332,20 @@ async def download_file(url: str, task_id: str, control_ws) -> Optional[Path]:
     downloaded = 0
     start_time = time.time()
     last_report = start_time
+
+    # 2.5 AWS Relay if not mirrored and likely foreign
+    is_foreign = False
+    if not mirror:
+        host = parsed.hostname or ""
+        if not (host.endswith(".cn") or "tuna.tsinghua" in host or "mirror" in host or "aliyun" in host):
+            is_foreign = True
+            
+    if is_foreign and os.path.exists("/data/iiisconnect/xuw-aws-jp-2026.pem"):
+        log.info(f"Task {task_id}: Trying aws-relay for {url}")
+        success = await download_aws_relay(url, task_id, tmp_path, control_ws)
+        if success:
+            return tmp_path
+        log.warning(f"Task {task_id}: aws-relay failed, falling back to direct")
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as client:
@@ -510,8 +598,8 @@ async def connect_data_channels(n: int) -> list:
             ws = await websockets.connect(
                 url,
                 max_size=20 * 1024 * 1024,
-                ping_interval=10,
-                ping_timeout=20,
+                ping_interval=30,
+                ping_timeout=60,
             )
             channels.append(ws)
             log.info(f"Data channel {i} connected")
@@ -538,8 +626,8 @@ async def agent_main():
             async with websockets.connect(
                 GATEWAY_WS_URL,
                 max_size=20 * 1024 * 1024,
-                ping_interval=10,
-                ping_timeout=20,
+                ping_interval=30,
+                ping_timeout=60,
             ) as control_ws:
                 # Register
                 await control_ws.send(json.dumps({
@@ -588,7 +676,14 @@ async def agent_main():
                     # Close data channels
                     for dc in data_channels:
                         if dc:
-                            await dc.close()
+                            try:
+                                await dc.close()
+                            except Exception:
+                                pass
+            
+            # If we reach here, connection closed cleanly
+            log.warning("Control WebSocket closed cleanly by server.")
+            await asyncio.sleep(RECONNECT_DELAY)
 
         except Exception as e:
             log.warning(f"Connection lost: {e}. Reconnecting in {RECONNECT_DELAY}s...")

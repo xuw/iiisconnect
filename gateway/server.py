@@ -24,7 +24,7 @@ import uvicorn
 # ---------------------------------------------------------------------------
 CACHE_DIR = Path(os.getenv("IIISCONNECT_CACHE_DIR", "/data/iiisconnect-cache"))
 CACHE_MAX_BYTES = int(os.getenv("IIISCONNECT_CACHE_MAX_GB", "5000")) * (1024 ** 3)  # 5TB default
-CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
+CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB
 HEADER_SIZE = 48
 BIND_HOST = os.getenv("IIISCONNECT_HOST", "0.0.0.0")
 BIND_PORT = int(os.getenv("IIISCONNECT_PORT", "8000"))
@@ -499,6 +499,7 @@ async def handle_agent_message(msg: dict):
             t.total_chunks = msg.get("total_chunks", 0)
             t.received_chunks = set()
             t.received_bytes = 0
+            t.transfer_started_at = time.time()
 
             # Create temp file for sparse writing
             tmp_dir = CACHE_DIR / "tmp"
@@ -516,9 +517,10 @@ async def handle_agent_message(msg: dict):
             t.status = "completed"
             t.progress = 100
             t.completed_at = time.time()
-            duration = t.completed_at - t.created_at
-            avg_speed = t.total_size / duration if duration > 0 else 0
-            log.info(f"Task {task_id}: completed in {duration:.1f}s, avg {avg_speed / 1e6:.1f} MB/s")
+            total_duration = t.completed_at - t.created_at
+            transfer_duration = t.completed_at - getattr(t, 'transfer_started_at', t.created_at)
+            avg_speed = t.total_size / transfer_duration if transfer_duration > 0 else 0
+            log.info(f"Task {task_id}: completed in {total_duration:.1f}s (transfer {transfer_duration:.1f}s), transfer speed {avg_speed / 1e6:.1f} MB/s")
 
             # Move to cache
             if t._tmp_path and t._tmp_path.exists():
