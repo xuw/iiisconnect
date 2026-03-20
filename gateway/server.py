@@ -24,7 +24,7 @@ import uvicorn
 # ---------------------------------------------------------------------------
 CACHE_DIR = Path(os.getenv("IIISCONNECT_CACHE_DIR", "/data/iiisconnect-cache"))
 CACHE_MAX_BYTES = int(os.getenv("IIISCONNECT_CACHE_MAX_GB", "5000")) * (1024 ** 3)  # 5TB default
-CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB
+CHUNK_SIZE = 128 * 1024  # 128 KB
 HEADER_SIZE = 48
 BIND_HOST = os.getenv("IIISCONNECT_HOST", "0.0.0.0")
 BIND_PORT = int(os.getenv("IIISCONNECT_PORT", "8000"))
@@ -510,8 +510,6 @@ async def handle_agent_message(msg: dict):
             t.filename = msg.get("filename", "")
             t.total_size = msg.get("size", 0)
             t.total_chunks = msg.get("total_chunks", 0)
-            t.received_chunks = set()
-            t.received_bytes = 0
             t.transfer_started_at = time.time()
             t._pipeline_mode = (t.total_size == 0)  # pipeline mode if size unknown
 
@@ -916,4 +914,6 @@ if __name__ == "__main__":
         port=BIND_PORT,
         log_level="info",
         ws_max_size=20 * 1024 * 1024,  # 20MB max WS frame
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )

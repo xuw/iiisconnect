@@ -42,7 +42,7 @@ GATEWAY_DATA_WS_BASE = os.getenv(
 CACHE_DIR = Path(os.getenv("IIISCONNECT_CACHE_DIR", "/cache/iiisconnect"))
 CACHE_MAX_BYTES = int(os.getenv("IIISCONNECT_CACHE_MAX_GB", "5000")) * (1024 ** 3)
 NUM_DATA_CHANNELS = int(os.getenv("IIISCONNECT_DATA_CHANNELS", "8"))
-CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB — matches WebSocket frame size
+CHUNK_SIZE = 128 * 1024  # 128 KB
 HEADER_SIZE = 48
 HEARTBEAT_INTERVAL = 10  # seconds
 RECONNECT_DELAY = 5  # seconds
@@ -435,6 +435,7 @@ async def _transfer_workers(
                 await ws.send(frame)
                 async with lock:
                     transferred += len(data)
+                await asyncio.sleep(0)  # Yield to event loop to prevent ping timeout
             except Exception as e:
                 log.error(f"Pipeline worker {wid} send error: {e}")
                 # re-queue so another worker can pick it up
@@ -698,6 +699,7 @@ async def transfer_file_from_disk(
                             "speed": int(speed),
                             "source": "websocket",
                         }))
+                await asyncio.sleep(0)  # Yield to event loop
             except Exception as e:
                 log.error(f"Worker {worker_id} send error: {e}")
                 await chunk_queue.put((chunk_idx, offset, size))
@@ -749,7 +751,12 @@ async def handle_tunnel(tunnel_id: str, host: str, port: int):
 
     ws_url = GATEWAY_WS_URL.replace("/ws/agent", f"/ws/tunnel_agent/{tunnel_id}")
     try:
-        async with websockets.connect(ws_url, max_size=20*1024*1024) as ws:
+        async with websockets.connect(
+            ws_url,
+            max_size=20*1024*1024,
+            ping_interval=60,
+            ping_timeout=180
+        ) as ws:
             async def tcp_to_ws():
                 try:
                     while True:
@@ -782,8 +789,8 @@ async def connect_data_channels(n: int) -> list:
             ws = await websockets.connect(
                 url,
                 max_size=20 * 1024 * 1024,
-                ping_interval=30,
-                ping_timeout=60,
+                ping_interval=None,
+                ping_timeout=None,
             )
             channels.append(ws)
             log.info(f"Data channel {i} connected")
@@ -810,8 +817,8 @@ async def agent_main():
             async with websockets.connect(
                 GATEWAY_WS_URL,
                 max_size=20 * 1024 * 1024,
-                ping_interval=30,
-                ping_timeout=60,
+                ping_interval=None,
+                ping_timeout=None,
             ) as control_ws:
                 # Register
                 await control_ws.send(json.dumps({

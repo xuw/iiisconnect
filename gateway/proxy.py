@@ -37,7 +37,12 @@ def is_accelerated(host: str) -> bool:
 
 async def open_agent_tunnel(host: str, port: int):
     ws_url = f"{GATEWAY_WS}/ws/tunnel_req/{host}/{port}"
-    return await websockets.connect(ws_url, max_size=20*1024*1024)
+    return await websockets.connect(
+        ws_url,
+        max_size=20*1024*1024,
+        ping_interval=None,
+        ping_timeout=None
+    )
 
 async def handle_connect(host: str, port: int, reader, writer):
     log.info(f"[CONNECT] {host}:{port} via Agent Tunnel")
