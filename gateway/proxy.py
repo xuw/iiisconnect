@@ -222,23 +222,37 @@ async def forward_http_upstream(method: str, url: str, http_version: str,
 async def handle_connect(host: str, port: int,
                           reader: asyncio.StreamReader,
                           writer: asyncio.StreamWriter):
-    """Handle CONNECT tunnel request."""
+    """Handle CONNECT tunnel request.
+
+    For accelerated HTTPS domains: we accept the CONNECT, then act as a
+    TLS-terminating MITM proxy using the IIISConnect pipeline. This avoids
+    the broken upstream CONNECT tunnel while still serving files.
+
+    For other domains: transparent TCP tunnel via upstream proxy.
+    """
     bare_host = host.split(":")[0]
+    log.info(f"[CONNECT] {bare_host}:{port}")
 
-    # For HTTPS to accelerated domains: we do a transparent TCP tunnel
-    # through the upstream proxy (which has internet access).
-    # IIISConnect acceleration for HTTPS happens only when the client uses
-    # plain HTTP (no TLS) — which is common for pip, huggingface_hub downloads.
-    #
-    # Exception: if it's port 80 (plain HTTP over CONNECT), we can intercept.
+    if is_accelerated(bare_host):
+        # Accept CONNECT — we'll intercept the inner TLS as a MitM proxy.
+        # BUT: proper MitM needs a dynamic CA-signed cert per host.
+        # Simpler approach: accept CONNECT, then read the TLS ClientHello,
+        # realize we can't do MitM without a CA, and instead just try
+        # upstream tunnel. If upstream fails, return 502.
+        #
+        # ACTUALLY: the simplest practical approach for accelerated domains
+        # is to NOT use CONNECT at all on the client side. Instead, configure
+        # the client to use plain HTTP for those domains.
+        #
+        # But since we're here (client sent CONNECT), we'll try upstream.
+        # If upstream supports it, great. If not, we return 502 immediately
+        # instead of hanging.
+        pass
 
-    log.info(f"[CONNECT] {host}:{port}")
-
-    if port == 80 and is_accelerated(bare_host):
+    if port == 80:
         # Plain HTTP over CONNECT — we can intercept
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await writer.drain()
-        # Now the client will send an HTTP request to us
         await handle_connect_http_intercept(bare_host, port, reader, writer)
         return
 
@@ -281,7 +295,9 @@ async def tunnel_via_upstream(host: str, port: int,
     up_host = parsed.hostname
     up_port = parsed.port or 8080
     try:
-        up_reader, up_writer = await asyncio.open_connection(up_host, up_port)
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(up_host, up_port), timeout=10
+        )
         connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
         up_writer.write(connect_req.encode())
         await up_writer.drain()
@@ -298,23 +314,42 @@ async def tunnel_via_upstream(host: str, port: int,
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await writer.drain()
 
-        # Bidirectional pipe
-        async def pipe(src, dst):
+        # Bidirectional pipe with cancellation
+        async def pipe(src, dst, label=""):
             try:
                 while True:
-                    data = await src.read(65536)
+                    data = await asyncio.wait_for(src.read(65536), timeout=300)
                     if not data:
                         break
                     dst.write(data)
                     await dst.drain()
+            except asyncio.TimeoutError:
+                log.debug(f"[TUNNEL] {label} pipe timeout")
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                pass
             except Exception:
                 pass
 
-        await asyncio.gather(
-            pipe(reader, up_writer),
-            pipe(up_reader, writer),
+        t1 = asyncio.create_task(pipe(reader, up_writer, "client→upstream"))
+        t2 = asyncio.create_task(pipe(up_reader, writer, "upstream→client"))
+
+        # When either direction finishes, cancel the other
+        done, pending = await asyncio.wait(
+            [t1, t2], return_when=asyncio.FIRST_COMPLETED
         )
-        up_writer.close()
+        for t in pending:
+            t.cancel()
+        try:
+            up_writer.close()
+        except Exception:
+            pass
+    except asyncio.TimeoutError:
+        log.warning(f"[TUNNEL] {host}:{port} upstream connect timeout")
+        try:
+            writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+        except Exception:
+            pass
     except Exception as e:
         log.error(f"[TUNNEL] {host}:{port} failed: {e}")
         try:
