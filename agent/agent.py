@@ -736,6 +736,41 @@ async def transfer_file_from_disk(
 # Main agent loop
 # ---------------------------------------------------------------------------
 
+
+async def handle_tunnel(tunnel_id: str, host: str, port: int):
+    import websockets
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10
+        )
+    except Exception as e:
+        log.error(f"Tunnel {tunnel_id} failed to connect to {host}:{port}: {e}")
+        return
+
+    ws_url = GATEWAY_WS_URL.replace("/ws/agent", f"/ws/tunnel_agent/{tunnel_id}")
+    try:
+        async with websockets.connect(ws_url, max_size=20*1024*1024) as ws:
+            async def tcp_to_ws():
+                try:
+                    while True:
+                        data = await reader.read(65536)
+                        if not data: break
+                        await ws.send(data)
+                except Exception: pass
+            async def ws_to_tcp():
+                try:
+                    async for message in ws:
+                        writer.write(message)
+                        await writer.drain()
+                except Exception: pass
+            
+            await asyncio.gather(tcp_to_ws(), ws_to_tcp())
+    except Exception as e:
+        log.error(f"Tunnel {tunnel_id} WS error: {e}")
+    finally:
+        try: writer.close()
+        except: pass
+
 async def connect_data_channels(n: int) -> list:
     """Establish N data channel WebSocket connections."""
     import websockets
@@ -814,6 +849,11 @@ async def agent_main():
                             log.info(f"Received task {task_id}: {url}")
                             asyncio.create_task(
                                 handle_task_pipeline(task_id, url, control_ws, data_channels)
+                            )
+                        
+                        elif msg.get("type") == "tunnel_open":
+                            asyncio.create_task(
+                                handle_tunnel(msg["tunnel_id"], msg["host"], msg["port"])
                             )
                         elif msg.get("type") == "heartbeat_ack":
                             pass

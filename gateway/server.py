@@ -59,6 +59,9 @@ class TaskState:
         self.completed_at: Optional[float] = None
         self._file_handle = None
         self._tmp_path: Optional[Path] = None
+        self._tmp_ready = asyncio.Event()  # Set when _tmp_path file is created
+        self._completion_event = asyncio.Event()  # Set when task is completed or failed
+        self._pending_chunks: list = []  # Buffer chunks arriving before tmp file is ready
 
     def to_dict(self) -> dict:
         d = {
@@ -412,25 +415,35 @@ async def fetch_file(url: str = Query(...)):
 
     await agent_ws.send_json({"type": "task", "task_id": task_id, "url": url})
 
-    # Wait for completion (up to 30 minutes)
-    for _ in range(1800):
-        await asyncio.sleep(1)
-        if t.status == "completed":
-            cached = cache_lookup(url)
-            if cached:
-                async def stream():
-                    async with aiofiles.open(cached, "rb") as f:
-                        while True:
-                            chunk = await f.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            yield chunk
-                return StreamingResponse(stream(), media_type="application/octet-stream",
-                                         headers={"Content-Disposition": f'attachment; filename="{cached.name}"'})
-        elif t.status == "failed":
-            raise HTTPException(502, f"Download failed: {t.error}")
+    # Wait for completion event (up to 30 minutes)
+    try:
+        await asyncio.wait_for(t._completion_event.wait(), timeout=1800)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Download timed out")
 
-    raise HTTPException(504, "Download timed out")
+    if t.status == "failed":
+        raise HTTPException(502, f"Download failed: {t.error}")
+
+    cached = cache_lookup(url)
+    if cached:
+        file_size = cached.stat().st_size
+        async def stream():
+            async with aiofiles.open(cached, "rb") as f:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        return StreamingResponse(
+            stream(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{cached.name}"',
+                "Content-Length": str(file_size),
+            },
+        )
+
+    raise HTTPException(500, "File completed but not found in cache")
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +528,19 @@ async def handle_agent_message(msg: dict):
                 # Pipeline mode: create empty file, will append/seek as chunks arrive
                 async with aiofiles.open(t._tmp_path, "wb") as f:
                     pass
+
+            # Flush any chunks that arrived before the file was created
+            if t._pending_chunks:
+                log.info(f"Task {task_id}: flushing {len(t._pending_chunks)} pending chunks")
+                for (offset, payload) in t._pending_chunks:
+                    async with aiofiles.open(t._tmp_path, "r+b") as f:
+                        await f.seek(offset)
+                        await f.write(payload)
+                t._pending_chunks.clear()
+
+            # Signal that tmp file is ready for writing
+            t._tmp_ready.set()
+
             log.info(f"Task {task_id}: transfer starting, {t.total_size / 1e6:.1f} MB, {t.total_chunks} chunks (pipeline={t._pipeline_mode})")
 
     elif msg_type == "transfer_complete":
@@ -530,7 +556,9 @@ async def handle_agent_message(msg: dict):
 
             # Move to cache
             if t._tmp_path and t._tmp_path.exists():
-                await cache_store(t.url, t.filename, t._tmp_path, t.total_size)
+                # Use received_bytes as actual size if total_size was 0 (pipeline mode)
+                actual_size = t.total_size if t.total_size > 0 else t.received_bytes
+                await cache_store(t.url, t.filename, t._tmp_path, actual_size)
 
                 # Copy to dest if specified
                 if t.dest:
@@ -538,11 +566,15 @@ async def handle_agent_message(msg: dict):
                     if cached:
                         asyncio.create_task(_copy_cached(cached, t.dest))
 
+            # Signal completion so /fetch waiters can proceed
+            t._completion_event.set()
+
     elif msg_type == "error":
         t = tasks.get(task_id)
         if t:
             t.status = "failed"
             t.error = msg.get("error", "Unknown error")
+            t._completion_event.set()
             log.error(f"Task {task_id}: failed - {t.error}")
 
     else:
@@ -609,16 +641,31 @@ async def ws_data(ws: WebSocket, channel_id: str):
                         except Exception:
                             pass
 
-            # Sparse write
-            if t._tmp_path:
-                async with aiofiles.open(t._tmp_path, "r+b") as f:
-                    await f.seek(offset)
-                    await f.write(payload)
+            # Write chunk to file
+            if t._tmp_path and t._tmp_ready.is_set():
+                try:
+                    async with aiofiles.open(t._tmp_path, "r+b") as f:
+                        await f.seek(offset)
+                        await f.write(payload)
+                except FileNotFoundError:
+                    # File was moved by cache_store — ignore late chunks
+                    log.debug(f"Late chunk for task {mapped_tid or task_id_hex} — file already cached")
+                    continue
 
                 t.received_chunks.add(chunk_idx)
                 t.received_bytes += len(payload)
                 if t.total_size > 0:
                     t.progress = int(t.received_bytes * 100 / t.total_size)
+            elif t._tmp_path is None:
+                # Buffer chunk until transfer_start creates the file
+                t._pending_chunks.append((offset, payload))
+                t.received_chunks.add(chunk_idx)
+                t.received_bytes += len(payload)
+            else:
+                # _tmp_path set but file not ready yet — buffer
+                t._pending_chunks.append((offset, payload))
+                t.received_chunks.add(chunk_idx)
+                t.received_bytes += len(payload)
 
     except WebSocketDisconnect:
         log.info(f"Data channel disconnected: {channel_id}")
@@ -629,6 +676,237 @@ async def ws_data(ws: WebSocket, channel_id: str):
 
 
 # ---------------------------------------------------------------------------
+# HTTP Relay: proxy arbitrary HTTP requests through agent
+# ---------------------------------------------------------------------------
+
+@app.get("/relay")
+async def relay_get(url: str = Query(...)):
+    """Relay an HTTP GET request through the agent's internet connection."""
+    if agent_ws is None:
+        raise HTTPException(503, "Agent not connected")
+
+    task_id = str(uuid.uuid4())[:8]
+    relay_tasks[task_id] = asyncio.Queue()
+
+    try:
+        await agent_ws.send_json({
+            "type": "relay",
+            "task_id": task_id,
+            "method": "GET",
+            "url": url,
+        })
+
+        # Wait for agent to start streaming response
+        result = await asyncio.wait_for(relay_tasks[task_id].get(), timeout=30)
+
+        if result.get("error"):
+            raise HTTPException(502, result["error"])
+
+        status_code = result.get("status_code", 200)
+        resp_headers = result.get("headers", {})
+
+        async def stream():
+            while True:
+                chunk_msg = await asyncio.wait_for(
+                    relay_tasks[task_id].get(), timeout=300
+                )
+                if chunk_msg.get("done"):
+                    break
+                if chunk_msg.get("error"):
+                    break
+                data = chunk_msg.get("data")
+                if data:
+                    import base64
+                    yield base64.b64decode(data)
+
+        headers_out = {}
+        for k, v in resp_headers.items():
+            if k.lower() not in ("transfer-encoding", "connection"):
+                headers_out[k] = v
+
+        return StreamingResponse(
+            stream(),
+            status_code=status_code,
+            headers=headers_out,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Agent relay timeout")
+    finally:
+        relay_tasks.pop(task_id, None)
+
+
+# Relay response queues
+relay_tasks: Dict[str, asyncio.Queue] = {}
+
+
+# ---------------------------------------------------------------------------
+# TCP Tunnel: CONNECT proxy through agent
+# ---------------------------------------------------------------------------
+
+@app.api_route("/tunnel/{host}/{port}", methods=["GET"])
+async def open_tunnel_http(host: str, port: int):
+    """Not used directly — tunnels use raw TCP via WebSocket."""
+    return {"error": "Use CONNECT method or WebSocket tunnel"}
+
+
+# Handle raw CONNECT requests at the ASGI level
+# FastAPI/uvicorn doesn't support CONNECT method natively,
+# so we handle tunnel requests from the proxy via a special endpoint.
+
+@app.websocket("/ws/tunnel/{host}/{port}")
+async def ws_tunnel(ws: WebSocket, host: str, port: int):
+    """
+    WebSocket-based tunnel. Proxy connects here, we ask agent to open
+    a TCP connection, then relay bytes.
+    """
+    await ws.accept()
+
+    if agent_ws is None:
+        await ws.close(1013, "Agent not connected")
+        return
+
+    tunnel_id = str(uuid.uuid4())[:8]
+    tunnel_queues[tunnel_id] = asyncio.Queue()
+
+    try:
+        # Ask agent to open TCP connection
+        await agent_ws.send_json({
+            "type": "tunnel_open",
+            "tunnel_id": tunnel_id,
+            "host": host,
+            "port": port,
+        })
+
+        # Wait for agent to confirm connection
+        result = await asyncio.wait_for(tunnel_queues[tunnel_id].get(), timeout=15)
+        if result.get("error"):
+            await ws.close(1013, result["error"])
+            return
+
+        # Bidirectional relay
+        async def ws_to_agent():
+            try:
+                while True:
+                    data = await ws.receive_bytes()
+                    await agent_ws.send_json({
+                        "type": "tunnel_data",
+                        "tunnel_id": tunnel_id,
+                        "data": __import__("base64").b64encode(data).decode(),
+                    })
+            except WebSocketDisconnect:
+                pass
+
+        async def agent_to_ws():
+            try:
+                while True:
+                    msg = await asyncio.wait_for(
+                        tunnel_queues[tunnel_id].get(), timeout=300
+                    )
+                    if msg.get("done") or msg.get("error"):
+                        break
+                    data = msg.get("data")
+                    if data:
+                        await ws.send_bytes(__import__("base64").b64decode(data))
+            except Exception:
+                pass
+
+        t1 = asyncio.create_task(ws_to_agent())
+        t2 = asyncio.create_task(agent_to_ws())
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+
+    except asyncio.TimeoutError:
+        await ws.close(1013, "Tunnel timeout")
+    finally:
+        # Tell agent to close tunnel
+        try:
+            await agent_ws.send_json({
+                "type": "tunnel_close",
+                "tunnel_id": tunnel_id,
+            })
+        except Exception:
+            pass
+        tunnel_queues.pop(tunnel_id, None)
+
+
+tunnel_queues: Dict[str, asyncio.Queue] = {}
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TCP Tunnel (Agent Relay for Proxy)
+# ---------------------------------------------------------------------------
+tunnel_sessions: Dict[str, dict] = {}
+
+@app.websocket("/ws/tunnel_req/{host}/{port}")
+async def ws_tunnel_req(ws: WebSocket, host: str, port: int):
+    await ws.accept()
+    if not agent_ws:
+        await ws.close(1013, "Agent not connected")
+        return
+
+    tunnel_id = str(uuid.uuid4())[:8]
+    tunnel_sessions[tunnel_id] = {"proxy_ws": ws, "agent_ws": None, "ready": asyncio.Event()}
+
+    try:
+        # Ask agent to open tunnel
+        await agent_ws.send_json({
+            "type": "tunnel_open",
+            "tunnel_id": tunnel_id,
+            "host": host,
+            "port": port
+        })
+        
+        # Wait for agent to connect back
+        try:
+            await asyncio.wait_for(tunnel_sessions[tunnel_id]["ready"].wait(), timeout=15)
+        except asyncio.TimeoutError:
+            await ws.close(1013, "Agent tunnel timeout")
+            return
+
+        a_ws = tunnel_sessions[tunnel_id]["agent_ws"]
+
+        async def p2a():
+            try:
+                while True:
+                    data = await ws.receive_bytes()
+                    await a_ws.send_bytes(data)
+            except Exception: pass
+            
+        async def a2p():
+            try:
+                while True:
+                    data = await a_ws.receive_bytes()
+                    await ws.send_bytes(data)
+            except Exception: pass
+
+        await asyncio.gather(p2a(), a2p())
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.error(f"Tunnel req error: {e}")
+    finally:
+        tunnel_sessions.pop(tunnel_id, None)
+
+@app.websocket("/ws/tunnel_agent/{tunnel_id}")
+async def ws_tunnel_agent(ws: WebSocket, tunnel_id: str):
+    await ws.accept()
+    session = tunnel_sessions.get(tunnel_id)
+    if not session:
+        await ws.close(1008, "Invalid tunnel_id")
+        return
+    session["agent_ws"] = ws
+    session["ready"].set()
+    try:
+        # Keep connection open. Reading happens in a2p above.
+        # But we must not read here or we'll steal bytes.
+        # Just sleep forever until the proxy closes the other end.
+        await asyncio.sleep(3600)
+    except Exception:
+        pass
+
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
