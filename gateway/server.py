@@ -500,16 +500,22 @@ async def handle_agent_message(msg: dict):
             t.received_chunks = set()
             t.received_bytes = 0
             t.transfer_started_at = time.time()
+            t._pipeline_mode = (t.total_size == 0)  # pipeline mode if size unknown
 
-            # Create temp file for sparse writing
+            # Create temp file
             tmp_dir = CACHE_DIR / "tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             t._tmp_path = tmp_dir / f"{task_id}_{t.filename}"
-            # Pre-allocate file
-            async with aiofiles.open(t._tmp_path, "wb") as f:
-                await f.seek(t.total_size - 1)
-                await f.write(b"\0")
-            log.info(f"Task {task_id}: transfer starting, {t.total_size / 1e6:.1f} MB, {t.total_chunks} chunks")
+            if t.total_size > 0:
+                # Pre-allocate file for sparse writing
+                async with aiofiles.open(t._tmp_path, "wb") as f:
+                    await f.seek(t.total_size - 1)
+                    await f.write(b"\0")
+            else:
+                # Pipeline mode: create empty file, will append/seek as chunks arrive
+                async with aiofiles.open(t._tmp_path, "wb") as f:
+                    pass
+            log.info(f"Task {task_id}: transfer starting, {t.total_size / 1e6:.1f} MB, {t.total_chunks} chunks (pipeline={t._pipeline_mode})")
 
     elif msg_type == "transfer_complete":
         t = tasks.get(task_id)
@@ -587,6 +593,21 @@ async def ws_data(ws: WebSocket, channel_id: str):
             if not t:
                 log.warning(f"Chunk for unknown task {task_id_hex}")
                 continue
+
+            # Update total_size / total_chunks from chunk header if pipeline mode
+            if total_size > 0 and (t.total_size == 0 or getattr(t, '_pipeline_mode', False)):
+                if t.total_size != total_size:
+                    t.total_size = total_size
+                    t.total_chunks = total_chunks
+                    t._pipeline_mode = False
+                    # Extend the file to the now-known size
+                    if t._tmp_path:
+                        try:
+                            async with aiofiles.open(t._tmp_path, "r+b") as ef:
+                                await ef.seek(total_size - 1)
+                                await ef.write(b"\0")
+                        except Exception:
+                            pass
 
             # Sparse write
             if t._tmp_path:

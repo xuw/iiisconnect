@@ -1,7 +1,11 @@
 """
 IIISConnect Agent — runs on iiis cluster.
-Connects to xsx gateway via WebSocket, downloads files via smart routing, 
+Connects to xsx gateway via WebSocket, downloads files via smart routing,
 and transfers them using parallel chunked WebSocket streams.
+
+v2: Pipeline mode — download and transfer overlap. Chunks are queued for
+    WebSocket send as soon as they arrive from the HTTP stream, so the
+    gateway starts receiving data while the download is still in progress.
 """
 import asyncio
 import hashlib
@@ -38,11 +42,15 @@ GATEWAY_DATA_WS_BASE = os.getenv(
 CACHE_DIR = Path(os.getenv("IIISCONNECT_CACHE_DIR", "/cache/iiisconnect"))
 CACHE_MAX_BYTES = int(os.getenv("IIISCONNECT_CACHE_MAX_GB", "5000")) * (1024 ** 3)
 NUM_DATA_CHANNELS = int(os.getenv("IIISCONNECT_DATA_CHANNELS", "8"))
-CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB
+CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB — matches WebSocket frame size
 HEADER_SIZE = 48
 HEARTBEAT_INTERVAL = 10  # seconds
 RECONNECT_DELAY = 5  # seconds
 AGENT_ID = os.getenv("IIISCONNECT_AGENT_ID", "iiis-01")
+
+# Pipeline queue depth: how many chunks can sit in memory waiting for send.
+# Too large wastes RAM; too small starves the senders.
+PIPELINE_QUEUE_DEPTH = int(os.getenv("IIISCONNECT_PIPELINE_DEPTH", "32"))
 
 # ---------------------------------------------------------------------------
 # Mirror rules
@@ -57,7 +65,7 @@ MIRROR_RULES = [
     {
         "name": "github-releases",
         "match": lambda url: "github.com" in url and ("/releases/" in url or "/archive/" in url),
-        "transform": lambda url: url.replace("github.com", "mirror.ghproxy.com/https://github.com") 
+        "transform": lambda url: url.replace("github.com", "mirror.ghproxy.com/https://github.com")
                                      if "ghproxy" not in url else url,
         "expected_speed": "2 MB/s",
     },
@@ -217,13 +225,13 @@ def cache_evict():
 
 
 # ---------------------------------------------------------------------------
-# Smart download
+# AWS relay (non-pipeline — downloads to local file first, then pipelines from there)
 # ---------------------------------------------------------------------------
 
 async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws) -> bool:
     ssh_key = "/data/iiisconnect/xuw-aws-jp-2026.pem"
     ssh_host = "ec2-user@13.208.212.186"
-    
+
     if not os.path.exists(ssh_key):
         log.error(f"AWS relay failed: SSH key {ssh_key} not found")
         return False
@@ -231,13 +239,13 @@ async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws
     parsed = urlparse(url)
     filename = Path(parsed.path).name or "download"
     remote_tmp = f"/tmp/{task_id}_{filename}"
-    
+
     log.info(f"Task {task_id}: Starting AWS relay download to {remote_tmp}")
     await control_ws.send(json.dumps({
         "type": "progress", "task_id": task_id, "status": "downloading",
         "progress": 0, "speed": 0, "source": "aws-relay (remote fetch)"
     }))
-    
+
     # 1. Download on AWS using curl
     curl_cmd = f"curl -C - -sL -o '{remote_tmp}' '{url}'"
     cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, curl_cmd]
@@ -246,7 +254,7 @@ async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws
     if proc.returncode != 0:
         log.error(f"Task {task_id}: AWS curl failed with code {proc.returncode}")
         return False
-        
+
     # Get remote size
     size_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, f"stat -c %s '{remote_tmp}'"]
     proc_sz = await asyncio.create_subprocess_exec(*size_cmd, stdout=asyncio.subprocess.PIPE)
@@ -257,17 +265,16 @@ async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws
         total_size = 0
 
     log.info(f"Task {task_id}: AWS fetch done ({total_size} bytes). Rsyncing back.")
-    
+
     # 2. Rsync from AWS to local
     rsync_cmd = [
         "rsync", "-a", "--append", "--partial", "-e", f"ssh -o StrictHostKeyChecking=no -i {ssh_key}",
         f"{ssh_host}:{remote_tmp}", str(dest_path)
     ]
     start_time = time.time()
-    last_report = start_time
-    
+
     proc = await asyncio.create_subprocess_exec(*rsync_cmd)
-    
+
     while proc.returncode is None:
         await asyncio.sleep(2)
         if total_size > 0 and dest_path.exists():
@@ -276,7 +283,6 @@ async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws
             elapsed = now - start_time
             speed = downloaded / elapsed if elapsed > 0 else 0
             progress = int(downloaded * 50 / total_size) if total_size > 0 else 0
-            # AWS relay handles up to 50% progress (the remaining 50% is transfer to Gateway)
             try:
                 await control_ws.send(json.dumps({
                     "type": "progress", "task_id": task_id, "status": "downloading",
@@ -284,207 +290,351 @@ async def download_aws_relay(url: str, task_id: str, dest_path: Path, control_ws
                 }))
             except:
                 pass
-        
+
     await proc.wait()
-    
+
     # 3. Clean up remote file
     rm_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-i", ssh_key, ssh_host, f"rm -f '{remote_tmp}'"]
     asyncio.create_task(asyncio.create_subprocess_exec(*rm_cmd))
-    
+
     return proc.returncode == 0 and dest_path.exists()
 
-async def download_file(url: str, task_id: str, control_ws) -> Optional[Path]:
-    """Download file using smart routing. Returns local path or None."""
 
-    # 1. Check local cache
-    cached = cache_lookup(url)
-    if cached:
-        log.info(f"Task {task_id}: cache hit → {cached}")
-        await control_ws.send(json.dumps({
-            "type": "progress",
-            "task_id": task_id,
-            "status": "downloading",
-            "progress": 100,
-            "speed": 0,
-            "source": "agent-cache",
-        }))
-        return cached
+# ---------------------------------------------------------------------------
+# Pipeline: overlapped download + transfer
+# ---------------------------------------------------------------------------
 
-    # 2. Try mirror
-    mirror = find_mirror(url)
-    source = "direct"
-    download_url = url
-    if mirror:
-        download_url = mirror["transform"](url)
-        source = f"china-mirror:{mirror['name']}"
-        log.info(f"Task {task_id}: using mirror {mirror['name']} → {download_url}")
+async def _stream_download(
+    download_url: str,
+    local_file: Path,
+    chunk_queue: asyncio.Queue,
+    task_id: str,
+    control_ws,
+    source: str,
+) -> int:
+    """
+    Download *download_url*, writing to *local_file* for cache and
+    simultaneously putting (chunk_idx, offset, data_bytes) into *chunk_queue*
+    so that the transfer workers can send them over WebSocket in parallel.
 
-    # 3. Download
-    tmp_dir = CACHE_DIR / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Extract filename from URL
-    parsed = urlparse(url)
-    filename = Path(parsed.path).name or "download"
-    tmp_path = tmp_dir / f"{task_id}_{filename}"
-
+    Returns total bytes written.
+    """
     total_size = 0
     downloaded = 0
+    chunk_idx = 0
     start_time = time.time()
     last_report = start_time
 
-    # 2.5 AWS Relay if not mirrored and likely foreign
-    is_foreign = False
-    if not mirror:
-        host = parsed.hostname or ""
-        if not (host.endswith(".cn") or "tuna.tsinghua" in host or "mirror" in host or "aliyun" in host):
-            is_foreign = True
-            
-    if is_foreign and os.path.exists("/data/iiisconnect/xuw-aws-jp-2026.pem"):
-        log.info(f"Task {task_id}: Trying aws-relay for {url}")
-        success = await download_aws_relay(url, task_id, tmp_path, control_ws)
-        if success:
-            return tmp_path
-        log.warning(f"Task {task_id}: aws-relay failed, falling back to direct")
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True
+    ) as client:
+        async with client.stream("GET", download_url) as resp:
+            if resp.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}",
+                    request=resp.request,
+                    response=resp,
+                )
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as client:
-            async with client.stream("GET", download_url) as resp:
-                if resp.status_code >= 400:
-                    # Fallback to direct if mirror failed
-                    if download_url != url:
-                        log.warning(f"Task {task_id}: mirror failed ({resp.status_code}), trying direct")
-                        source = "direct"
-                        download_url = url
+            total_size = int(resp.headers.get("content-length", 0))
 
-                        async with client.stream("GET", download_url) as resp2:
-                            if resp2.status_code >= 400:
-                                await control_ws.send(json.dumps({
-                                    "type": "error",
-                                    "task_id": task_id,
-                                    "error": f"Download failed: HTTP {resp2.status_code}",
-                                }))
-                                return None
-                            total_size = int(resp2.headers.get("content-length", 0))
-                            async with aiofiles.open(tmp_path, "wb") as f:
-                                async for chunk in resp2.aiter_bytes(chunk_size=1024 * 1024):
-                                    await f.write(chunk)
-                                    downloaded += len(chunk)
-                                    now = time.time()
-                                    if now - last_report >= 2:
-                                        elapsed = now - start_time
-                                        speed = downloaded / elapsed if elapsed > 0 else 0
-                                        progress = int(downloaded * 50 / total_size) if total_size > 0 else 0
-                                        await control_ws.send(json.dumps({
-                                            "type": "progress",
-                                            "task_id": task_id,
-                                            "status": "downloading",
-                                            "progress": progress,
-                                            "speed": int(speed),
-                                            "source": source,
-                                        }))
-                                        last_report = now
-                    else:
-                        await control_ws.send(json.dumps({
-                            "type": "error",
-                            "task_id": task_id,
-                            "error": f"Download failed: HTTP {resp.status_code}",
-                        }))
-                        return None
-                else:
-                    total_size = int(resp.headers.get("content-length", 0))
-                    etag = resp.headers.get("etag", "")
-                    async with aiofiles.open(tmp_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            now = time.time()
-                            if now - last_report >= 2:
-                                elapsed = now - start_time
-                                speed = downloaded / elapsed if elapsed > 0 else 0
-                                progress = int(downloaded * 50 / total_size) if total_size > 0 else 0
+            async with aiofiles.open(local_file, "wb") as f:
+                buf = bytearray()
+                async for raw in resp.aiter_bytes(chunk_size=256 * 1024):
+                    buf.extend(raw)
+                    # Flush full CHUNK_SIZE pieces
+                    while len(buf) >= CHUNK_SIZE:
+                        piece = bytes(buf[:CHUNK_SIZE])
+                        del buf[:CHUNK_SIZE]
+                        offset = chunk_idx * CHUNK_SIZE
+                        await f.write(piece)
+                        downloaded += len(piece)
+                        # Put into pipeline queue (may block if senders are slow)
+                        await chunk_queue.put((chunk_idx, offset, piece))
+                        chunk_idx += 1
+
+                        # Progress
+                        now = time.time()
+                        if now - last_report >= 2:
+                            elapsed = now - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            pct = int(downloaded * 100 / total_size) if total_size > 0 else 0
+                            try:
                                 await control_ws.send(json.dumps({
                                     "type": "progress",
                                     "task_id": task_id,
-                                    "status": "downloading",
-                                    "progress": progress,
+                                    "status": "pipeline",
+                                    "progress": pct,
                                     "speed": int(speed),
                                     "source": source,
                                 }))
-                                last_report = now
+                            except:
+                                pass
+                            last_report = now
 
-    except Exception as e:
-        log.error(f"Task {task_id}: download error: {e}")
-        # Fallback to direct if mirror failed
-        if download_url != url:
-            log.info(f"Task {task_id}: mirror failed, falling back to direct")
-            source = "direct-fallback"
+                # Flush remaining bytes in buf
+                if buf:
+                    piece = bytes(buf)
+                    offset = chunk_idx * CHUNK_SIZE
+                    await f.write(piece)
+                    downloaded += len(piece)
+                    await chunk_queue.put((chunk_idx, offset, piece))
+                    chunk_idx += 1
+
+    return downloaded
+
+
+async def _transfer_workers(
+    chunk_queue: asyncio.Queue,
+    data_websockets: list,
+    task_uuid: bytes,
+    file_size: int,
+    total_chunks_est: int,
+    task_id: str,
+    control_ws,
+    done_event: asyncio.Event,
+):
+    """
+    Consume (chunk_idx, offset, data) from *chunk_queue* and send them over
+    parallel WebSocket data channels.  Exits when *done_event* is set AND
+    the queue is empty.
+    """
+    active_ws = [ws for ws in data_websockets if ws is not None]
+    if not active_ws:
+        log.error(f"Task {task_id}: no data channels for pipeline transfer")
+        return
+
+    transferred = 0
+    lock = asyncio.Lock()
+    start_time = time.time()
+
+    async def worker(ws, wid: int):
+        nonlocal transferred
+        while True:
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as client:
-                    async with client.stream("GET", url) as resp:
-                        if resp.status_code >= 400:
-                            await control_ws.send(json.dumps({
-                                "type": "error",
-                                "task_id": task_id,
-                                "error": f"Direct fallback also failed: HTTP {resp.status_code}",
-                            }))
-                            return None
-                        total_size = int(resp.headers.get("content-length", 0))
-                        downloaded = 0
-                        start_time = time.time()
-                        async with aiofiles.open(tmp_path, "wb") as f:
-                            async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
-                                await f.write(chunk)
-                                downloaded += len(chunk)
-                                now = time.time()
-                                if now - last_report >= 2:
-                                    elapsed = now - start_time
-                                    speed = downloaded / elapsed if elapsed > 0 else 0
-                                    progress = int(downloaded * 50 / total_size) if total_size > 0 else 0
-                                    await control_ws.send(json.dumps({
-                                        "type": "progress",
-                                        "task_id": task_id,
-                                        "status": "downloading",
-                                        "progress": progress,
-                                        "speed": int(speed),
-                                        "source": source,
-                                    }))
-                                    last_report = now
-            except Exception as e2:
-                await control_ws.send(json.dumps({
-                    "type": "error",
-                    "task_id": task_id,
-                    "error": f"All download attempts failed: {e2}",
-                }))
-                return None
-        else:
-            await control_ws.send(json.dumps({
-                "type": "error",
-                "task_id": task_id,
-                "error": f"Download failed: {e}",
-            }))
-            return None
+                chunk_idx, offset, data = chunk_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if done_event.is_set():
+                    return  # producer finished
+                await asyncio.sleep(0.01)
+                continue
+
+            # Build binary frame
+            header = bytearray(HEADER_SIZE)
+            header[0:16] = task_uuid
+            struct.pack_into(">Q", header, 16, offset)
+            struct.pack_into(">I", header, 24, len(data))
+            struct.pack_into(">Q", header, 28, file_size)
+            struct.pack_into(">I", header, 36, chunk_idx)
+            struct.pack_into(">I", header, 40, total_chunks_est)
+            struct.pack_into(">I", header, 44, 0)
+
+            frame = bytes(header) + data
+
+            try:
+                await ws.send(frame)
+                async with lock:
+                    transferred += len(data)
+            except Exception as e:
+                log.error(f"Pipeline worker {wid} send error: {e}")
+                # re-queue so another worker can pick it up
+                await chunk_queue.put((chunk_idx, offset, data))
+                break
+
+    workers = [asyncio.create_task(worker(ws, i)) for i, ws in enumerate(active_ws)]
+    await asyncio.gather(*workers)
 
     elapsed = time.time() - start_time
-    actual_size = tmp_path.stat().st_size if tmp_path.exists() else downloaded
-    speed = actual_size / elapsed if elapsed > 0 else 0
-    log.info(f"Task {task_id}: downloaded {actual_size / 1e6:.1f} MB in {elapsed:.1f}s ({speed / 1e6:.1f} MB/s) via {source}")
+    speed = transferred / elapsed if elapsed > 0 else 0
+    log.info(
+        f"Task {task_id}: pipeline transfer sent {transferred / 1e6:.1f} MB "
+        f"in {elapsed:.1f}s ({speed / 1e6:.1f} MB/s) via {len(active_ws)} channels"
+    )
 
-    # Store in cache
-    cache_store_file(url, filename, tmp_path, actual_size)
-    return cache_lookup(url)
+
+async def handle_task_pipeline(
+    task_id: str,
+    url: str,
+    control_ws,
+    data_channels: list,
+):
+    """
+    Pipeline task handler: download and transfer happen concurrently.
+    """
+    try:
+        # ---- 1. Cache hit? ----
+        cached = cache_lookup(url)
+        if cached:
+            log.info(f"Task {task_id}: cache hit → {cached}")
+            await control_ws.send(json.dumps({
+                "type": "progress", "task_id": task_id,
+                "status": "downloading", "progress": 100,
+                "speed": 0, "source": "agent-cache",
+            }))
+            # Transfer the cached file (non-pipeline, already local)
+            await transfer_file_from_disk(cached, task_id, control_ws, data_channels)
+            return
+
+        # ---- 2. Resolve download URL ----
+        parsed = urlparse(url)
+        mirror = find_mirror(url)
+        source = "direct"
+        download_url = url
+        if mirror:
+            download_url = mirror["transform"](url)
+            source = f"china-mirror:{mirror['name']}"
+            log.info(f"Task {task_id}: using mirror {mirror['name']} → {download_url}")
+
+        # ---- 2.5 AWS Relay (non-pipeline, falls through to disk transfer) ----
+        is_foreign = False
+        if not mirror:
+            host = parsed.hostname or ""
+            if not (host.endswith(".cn") or "tuna.tsinghua" in host
+                    or "mirror" in host or "aliyun" in host):
+                is_foreign = True
+
+        if is_foreign and os.path.exists("/data/iiisconnect/xuw-aws-jp-2026.pem"):
+            log.info(f"Task {task_id}: Trying aws-relay for {url}")
+            tmp_dir = CACHE_DIR / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            filename = Path(parsed.path).name or "download"
+            tmp_path = tmp_dir / f"{task_id}_{filename}"
+            success = await download_aws_relay(url, task_id, tmp_path, control_ws)
+            if success:
+                actual_size = tmp_path.stat().st_size
+                cache_store_file(url, filename, tmp_path, actual_size)
+                cached = cache_lookup(url)
+                if cached:
+                    await transfer_file_from_disk(cached, task_id, control_ws, data_channels)
+                return
+            log.warning(f"Task {task_id}: aws-relay failed, falling back")
+
+        # ---- 3. Pipeline download + transfer ----
+        filename = Path(parsed.path).name or "download"
+        tmp_dir = CACHE_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / f"{task_id}_{filename}"
+
+        # We need to know total_size for the transfer_start message.
+        # Do a HEAD request first.
+        total_size = 0
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0), follow_redirects=True
+            ) as cl:
+                head = await cl.head(download_url)
+                total_size = int(head.headers.get("content-length", 0))
+        except Exception:
+            pass  # unknown size is okay, we'll update
+
+        total_chunks_est = max(1, (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE) if total_size > 0 else 0
+
+        task_uuid = uuid.uuid5(uuid.NAMESPACE_URL, task_id).bytes
+
+        # Notify gateway of transfer start
+        await control_ws.send(json.dumps({
+            "type": "transfer_start",
+            "task_id": task_id,
+            "filename": filename,
+            "size": total_size,
+            "total_chunks": total_chunks_est,
+            "sha256": "",
+        }))
+
+        # Shared bounded queue
+        chunk_queue: asyncio.Queue = asyncio.Queue(maxsize=PIPELINE_QUEUE_DEPTH)
+        done_event = asyncio.Event()
+
+        # Launch transfer workers
+        transfer_task = asyncio.create_task(
+            _transfer_workers(
+                chunk_queue, data_channels, task_uuid,
+                total_size, total_chunks_est,
+                task_id, control_ws, done_event,
+            )
+        )
+
+        # Download (producer) — blocks until complete
+        start_time = time.time()
+        try:
+            actual_size = await _stream_download(
+                download_url, tmp_path, chunk_queue,
+                task_id, control_ws, source,
+            )
+        except Exception as dl_err:
+            log.error(f"Task {task_id}: pipeline download error: {dl_err}")
+            # Try direct fallback if mirror was used
+            if download_url != url:
+                log.info(f"Task {task_id}: mirror failed, retrying direct in pipeline")
+                source = "direct-fallback"
+                try:
+                    actual_size = await _stream_download(
+                        url, tmp_path, chunk_queue,
+                        task_id, control_ws, source,
+                    )
+                except Exception as dl_err2:
+                    done_event.set()
+                    await transfer_task
+                    await control_ws.send(json.dumps({
+                        "type": "error", "task_id": task_id,
+                        "error": f"All download attempts failed: {dl_err2}",
+                    }))
+                    return
+            else:
+                done_event.set()
+                await transfer_task
+                await control_ws.send(json.dumps({
+                    "type": "error", "task_id": task_id,
+                    "error": f"Download failed: {dl_err}",
+                }))
+                return
+
+        # Signal workers that no more chunks are coming
+        done_event.set()
+        await transfer_task
+
+        elapsed = time.time() - start_time
+        speed = actual_size / elapsed if elapsed > 0 else 0
+        log.info(
+            f"Task {task_id}: pipeline finished {actual_size / 1e6:.1f} MB "
+            f"in {elapsed:.1f}s ({speed / 1e6:.1f} MB/s end-to-end) via {source}"
+        )
+
+        # Store in cache
+        cache_store_file(url, filename, tmp_path, actual_size)
+
+        # Notify gateway: transfer complete
+        try:
+            await control_ws.send(json.dumps({
+                "type": "transfer_complete",
+                "task_id": task_id,
+                "sha256_verified": False,
+            }))
+        except Exception as e:
+            log.warning(f"Task {task_id}: complete notification failed: {e}")
+
+    except Exception as e:
+        log.error(f"Task {task_id} failed: {e}", exc_info=True)
+        try:
+            await control_ws.send(json.dumps({
+                "type": "error", "task_id": task_id, "error": str(e),
+            }))
+        except:
+            pass
 
 
 # ---------------------------------------------------------------------------
-# Chunked transfer via parallel data channels
+# Legacy disk-based transfer (used for cache-hit & AWS relay)
 # ---------------------------------------------------------------------------
-async def transfer_file(file_path: Path, task_id: str, control_ws, data_websockets: list):
-    """Transfer file to gateway using parallel data channels."""
+
+async def transfer_file_from_disk(
+    file_path: Path, task_id: str, control_ws, data_websockets: list
+):
+    """Transfer an already-local file to gateway using parallel data channels."""
     file_size = file_path.stat().st_size
     filename = file_path.name
-    total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    total_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
-    # Generate a UUID for the task (used in binary headers)
     task_uuid = uuid.uuid5(uuid.NAMESPACE_URL, task_id).bytes
 
     # Notify gateway
@@ -494,10 +644,10 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
         "filename": filename,
         "size": file_size,
         "total_chunks": total_chunks,
-        "sha256": "",  # Could compute but expensive for large files
+        "sha256": "",
     }))
 
-    # Create chunk work queue
+    # Build chunk work queue
     chunk_queue: asyncio.Queue = asyncio.Queue()
     for i in range(total_chunks):
         offset = i * CHUNK_SIZE
@@ -516,12 +666,10 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
             except asyncio.QueueEmpty:
                 break
 
-            # Read chunk from file
             async with aiofiles.open(file_path, "rb") as f:
                 await f.seek(offset)
                 data = await f.read(size)
 
-            # Build header (48 bytes)
             header = bytearray(HEADER_SIZE)
             header[0:16] = task_uuid
             struct.pack_into(">Q", header, 16, offset)
@@ -529,7 +677,7 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
             struct.pack_into(">Q", header, 28, file_size)
             struct.pack_into(">I", header, 36, chunk_idx)
             struct.pack_into(">I", header, 40, total_chunks)
-            struct.pack_into(">I", header, 44, 0)  # flags
+            struct.pack_into(">I", header, 44, 0)
 
             frame = bytes(header) + data
 
@@ -537,13 +685,11 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
                 await ws.send(frame)
                 async with lock:
                     transferred += len(data)
-                    now = time.time()
-                    elapsed = now - start_time
-                    speed = transferred / elapsed if elapsed > 0 else 0
-                    progress = 50 + int(transferred * 50 / file_size)
-
-                    # Report progress every few chunks
                     if chunk_idx % max(1, total_chunks // 20) == 0 or chunk_idx == total_chunks - 1:
+                        now = time.time()
+                        elapsed = now - start_time
+                        speed = transferred / elapsed if elapsed > 0 else 0
+                        progress = int(transferred * 100 / file_size)
                         await control_ws.send(json.dumps({
                             "type": "progress",
                             "task_id": task_id,
@@ -554,17 +700,14 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
                         }))
             except Exception as e:
                 log.error(f"Worker {worker_id} send error: {e}")
-                # Re-queue the chunk
                 await chunk_queue.put((chunk_idx, offset, size))
                 break
 
-    # Run workers in parallel
     active_ws = [ws for ws in data_websockets if ws is not None]
     if not active_ws:
         log.error(f"Task {task_id}: no data channels available!")
         await control_ws.send(json.dumps({
-            "type": "error",
-            "task_id": task_id,
+            "type": "error", "task_id": task_id,
             "error": "No data channels available",
         }))
         return
@@ -574,19 +717,25 @@ async def transfer_file(file_path: Path, task_id: str, control_ws, data_websocke
 
     elapsed = time.time() - start_time
     speed = file_size / elapsed if elapsed > 0 else 0
-    log.info(f"Task {task_id}: transferred {file_size / 1e6:.1f} MB in {elapsed:.1f}s ({speed / 1e6:.1f} MB/s) via {len(active_ws)} channels")
+    log.info(
+        f"Task {task_id}: disk transfer {file_size / 1e6:.1f} MB "
+        f"in {elapsed:.1f}s ({speed / 1e6:.1f} MB/s) via {len(active_ws)} channels"
+    )
 
-    # Notify completion
-    await control_ws.send(json.dumps({
-        "type": "transfer_complete",
-        "task_id": task_id,
-        "sha256_verified": False,
-    }))
+    try:
+        await control_ws.send(json.dumps({
+            "type": "transfer_complete",
+            "task_id": task_id,
+            "sha256_verified": False,
+        }))
+    except Exception as e:
+        log.warning(f"Task {task_id}: complete notification failed: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------------------------
+
 async def connect_data_channels(n: int) -> list:
     """Establish N data channel WebSocket connections."""
     import websockets
@@ -633,14 +782,14 @@ async def agent_main():
                 await control_ws.send(json.dumps({
                     "type": "register",
                     "agent_id": AGENT_ID,
-                    "capabilities": ["mirror", "direct"],
+                    "capabilities": ["mirror", "direct", "aws-relay", "pipeline"],
                 }))
                 log.info("Registered with gateway")
 
                 # Connect data channels
                 data_channels = await connect_data_channels(NUM_DATA_CHANNELS)
 
-                # Start heartbeat task
+                # Start heartbeat
                 async def heartbeat():
                     while True:
                         try:
@@ -651,7 +800,7 @@ async def agent_main():
 
                 hb_task = asyncio.create_task(heartbeat())
 
-                # Process tasks from gateway
+                # Process tasks
                 try:
                     async for message in control_ws:
                         try:
@@ -663,9 +812,8 @@ async def agent_main():
                             task_id = msg["task_id"]
                             url = msg["url"]
                             log.info(f"Received task {task_id}: {url}")
-                            # Handle task in background
                             asyncio.create_task(
-                                handle_task(task_id, url, control_ws, data_channels)
+                                handle_task_pipeline(task_id, url, control_ws, data_channels)
                             )
                         elif msg.get("type") == "heartbeat_ack":
                             pass
@@ -673,44 +821,19 @@ async def agent_main():
                             log.debug(f"Unknown message: {msg}")
                 finally:
                     hb_task.cancel()
-                    # Close data channels
                     for dc in data_channels:
                         if dc:
                             try:
                                 await dc.close()
                             except Exception:
                                 pass
-            
-            # If we reach here, connection closed cleanly
+
             log.warning("Control WebSocket closed cleanly by server.")
             await asyncio.sleep(RECONNECT_DELAY)
 
         except Exception as e:
             log.warning(f"Connection lost: {e}. Reconnecting in {RECONNECT_DELAY}s...")
             await asyncio.sleep(RECONNECT_DELAY)
-
-
-async def handle_task(task_id: str, url: str, control_ws, data_channels: list):
-    """Handle a download + transfer task."""
-    try:
-        # Download
-        file_path = await download_file(url, task_id, control_ws)
-        if not file_path:
-            return
-
-        # Transfer to gateway
-        await transfer_file(file_path, task_id, control_ws, data_channels)
-
-    except Exception as e:
-        log.error(f"Task {task_id} failed: {e}")
-        try:
-            await control_ws.send(json.dumps({
-                "type": "error",
-                "task_id": task_id,
-                "error": str(e),
-            }))
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
