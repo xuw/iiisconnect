@@ -22,8 +22,17 @@ spec:
   - host: iiisconnect.iiis.co
     http:
       paths:
-      - path: /
+      # Only expose WebSocket paths for cross-cluster agent connection
+      - path: /ws
         pathType: Prefix
+        backend:
+          service:
+            name: iiisconnect-gateway
+            port:
+              number: 80
+      # Health check for Ingress/cert-manager probes
+      - path: /health
+        pathType: Exact
         backend:
           service:
             name: iiisconnect-gateway
