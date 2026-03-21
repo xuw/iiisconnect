@@ -225,9 +225,11 @@ async def open_agent_tunnel(host: str, port: int):
     )
 
 async def handle_connect(host: str, port: int, reader, writer):
-    # For accelerated domains, use MITM to intercept HTTPS and route
-    # requests through the gateway /fetch API (pipeline + caching).
-    if is_accelerated(host) and port == 443:
+    # For accelerated domains that need domain rewriting (e.g. huggingface.co → hf-mirror.com),
+    # use MITM to intercept HTTPS and route requests through the gateway /fetch API.
+    # Mirror domains themselves (e.g. hf-mirror.com) don't need MITM — they can be
+    # tunneled directly since there's no SNI mismatch.
+    if host.lower() in TUNNEL_REWRITE and port == 443:
         await _handle_connect_mitm(host, port, reader, writer)
         return
 
@@ -282,7 +284,7 @@ async def _handle_connect_mitm(host: str, port: int, reader, writer):
     4. Route each request through gateway /fetch (pipeline + cache)
     5. Send HTTP responses back over TLS
     """
-    log.info(f"[CONNECT-MITM] {host}:{port} — intercepting HTTPS for pipeline acceleration")
+    log.info(f"[CONNECT-MITM] enter _handle_connect_mitm host={host} port={port} — intercepting HTTPS for pipeline acceleration")
 
     # Generate (or retrieve cached) TLS context for this domain
     try:
@@ -297,29 +299,36 @@ async def _handle_connect_mitm(host: str, port: int, reader, writer):
     writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
     await writer.drain()
 
-    # Upgrade the connection to TLS (we are the TLS server)
-    loop = asyncio.get_event_loop()
+    # Upgrade the connection to TLS (we are the TLS server).
+    # Key insight: we must reuse the EXISTING protocol (StreamReaderProtocol)
+    # that's already bound to the reader. start_tls replaces the transport
+    # under the same protocol, so data_received() continues feeding the
+    # same StreamReader. Creating a NEW StreamReaderProtocol breaks this.
     transport = writer.transport
+    protocol = transport.get_protocol()  # the existing StreamReaderProtocol
+    loop = asyncio.get_event_loop()
+
     try:
-        tls_transport = await loop.start_tls(
-            transport, transport.get_protocol(), ssl_ctx, server_side=True
+        log.info(f"[CONNECT-MITM] starting TLS handshake for host={host}")
+        new_transport = await loop.start_tls(
+            transport, protocol, ssl_ctx, server_side=True
         )
+        log.info(f"[CONNECT-MITM] TLS handshake succeeded for host={host}")
     except Exception as e:
-        log.error(f"[CONNECT-MITM] TLS handshake failed for {host}: {e}")
+        log.exception(f"[CONNECT-MITM] TLS handshake failed for {host}: {e}")
         return
 
-    # Replace reader/writer with TLS-wrapped versions
-    tls_reader = asyncio.StreamReader()
-    tls_protocol = asyncio.StreamReaderProtocol(tls_reader)
-    tls_transport.set_protocol(tls_protocol)
-    tls_protocol.connection_made(tls_transport)
-    tls_writer = asyncio.StreamWriter(tls_transport, tls_protocol, tls_reader, loop)
+    # The original reader is now fed by the TLS transport (same protocol).
+    # We just need a new writer pointing to the new transport.
+    tls_reader = reader  # same reader, now receives decrypted data
+    tls_writer = asyncio.StreamWriter(new_transport, protocol, tls_reader, loop)
 
     # Now read plaintext HTTP requests from the TLS stream
     try:
+        log.info(f"[CONNECT-MITM] entering _serve_mitm_requests for host={host}")
         await _serve_mitm_requests(host, tls_reader, tls_writer)
     except Exception as e:
-        log.debug(f"[CONNECT-MITM] session ended for {host}: {e}")
+        log.info(f"[CONNECT-MITM] session ended for {host}: {e}")
     finally:
         try:
             tls_writer.close()
@@ -333,11 +342,15 @@ async def _serve_mitm_requests(host: str, reader: asyncio.StreamReader, writer: 
     Supports HTTP/1.1 keep-alive: loops until the client closes or
     sends Connection: close.
     """
+    log.info(f"[CONNECT-MITM] _serve_mitm_requests loop start host={host}")
     while True:
         # Read request line + headers
         try:
+            log.info(f"[CONNECT-MITM] waiting for request line host={host}")
             header_data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=120)
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+            log.info(f"[CONNECT-MITM] got request header bytes={len(header_data)} host={host}")
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
+            log.info(f"[CONNECT-MITM] request read ended host={host}: {type(e).__name__}: {e}")
             break
 
         text = header_data.decode(errors="replace")
@@ -349,6 +362,7 @@ async def _serve_mitm_requests(host: str, reader: asyncio.StreamReader, writer: 
         if len(req_parts) < 3:
             break
         method, path, version = req_parts[0], req_parts[1], req_parts[2]
+        log.info(f"[CONNECT-MITM] parsed request host={host} method={method} path={path} version={version}")
 
         # Parse headers
         headers = {}
@@ -371,18 +385,17 @@ async def _serve_mitm_requests(host: str, reader: asyncio.StreamReader, writer: 
 
         # Reconstruct the full URL
         url = f"https://{host}{path}"
-        log.info(f"[CONNECT-MITM] {method} {url}")
+        log.info(f"[CONNECT-MITM] serving request method={method} url={url}")
 
         # Route GET/HEAD through gateway for accelerated domains
         if method.upper() in ("GET", "HEAD"):
             try:
+                log.info(f"[CONNECT-MITM] dispatching to _mitm_fetch_via_gateway method={method} url={url}")
                 await _mitm_fetch_via_gateway(url, method, headers, writer)
-                if connection == "close":
-                    break
-                continue
+                log.info(f"[CONNECT-MITM] finished _mitm_fetch_via_gateway method={method} url={url}; closing MITM connection to avoid client hang")
+                break
             except Exception as e:
-                log.warning(f"[CONNECT-MITM] gateway fetch failed for {url}: {e}, "
-                           f"falling back to agent tunnel")
+                log.exception(f"[CONNECT-MITM] gateway fetch failed for {url}: {e}, falling back to agent tunnel")
 
         # For other methods or if gateway fetch failed, proxy via HTTP to mirror
         await _mitm_proxy_via_http(host, method, path, version, headers, body, writer)
@@ -394,6 +407,7 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
     """Fetch a URL via the gateway /fetch API and write the HTTP response."""
     parsed = urlparse(url)
     req_method = method.upper()
+    log.info(f"[CONNECT-MITM] enter _mitm_fetch_via_gateway method={req_method} url={url}")
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(1800, connect=30),
@@ -410,26 +424,61 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
                 if h in headers:
                     req_headers[h] = headers[h]
 
-            resp = await client.request("HEAD", mirror_url, headers=req_headers, follow_redirects=True)
+            timeout = httpx.Timeout(60, connect=15)
+            log.info(f"[CONNECT-MITM] HEAD start mirror_url={mirror_url} original_url={url}")
+            resp = await client.request("HEAD", mirror_url, headers=req_headers, follow_redirects=False, timeout=timeout)
+            log.info(f"[CONNECT-MITM] HEAD first response status={resp.status_code} headers={list(resp.headers.keys())} location={resp.headers.get('location')!r}")
+            location = resp.headers.get("location")
+            hidden_external_redirect = False
+            if location and 300 <= resp.status_code < 400:
+                next_url = httpx.URL(mirror_url).join(location)
+                if next_url.host not in (mirror_host, parsed.hostname) and next_url.host:
+                    hidden_external_redirect = True
+                    log.info(f"[CONNECT-MITM] HEAD redirect hidden from client: {mirror_url} -> {next_url}")
+                elif next_url.host in (mirror_host, parsed.hostname):
+                    log.info(f"[CONNECT-MITM] HEAD following same-host redirect next_url={next_url}")
+                    resp = await client.request("HEAD", str(next_url), headers=req_headers, follow_redirects=False, timeout=timeout)
+                    log.info(f"[CONNECT-MITM] HEAD second response status={resp.status_code} headers={list(resp.headers.keys())} location={resp.headers.get('location')!r}")
+                    location = resp.headers.get("location")
+                    if location and 300 <= resp.status_code < 400:
+                        next2 = httpx.URL(str(next_url)).join(location)
+                        if next2.host not in (mirror_host, parsed.hostname) and next2.host:
+                            hidden_external_redirect = True
+                            log.info(f"[CONNECT-MITM] HEAD redirect hidden from client: {next_url} -> {next2}")
+
+            status_code = 200 if hidden_external_redirect and resp.status_code in (302, 307, 308) else resp.status_code
             status_text = {200: "OK", 206: "Partial Content", 301: "Moved Permanently",
                            302: "Found", 303: "See Other", 304: "Not Modified",
                            307: "Temporary Redirect", 308: "Permanent Redirect",
-                           404: "Not Found"}.get(resp.status_code, "OK")
+                           404: "Not Found"}.get(status_code, "OK")
             resp_headers = ""
-            for h in ("content-length", "content-type", "location", "etag", "x-linked-etag",
+            fake_location = f"https://{parsed.hostname}{parsed.path or '/'}"
+            if parsed.query:
+                fake_location += f"?{parsed.query}"
+
+            for h in ("content-length", "content-type", "etag", "x-linked-etag",
                       "x-linked-size", "x-repo-commit", "accept-ranges", "date", "server",
                       "content-disposition", "cache-control", "last-modified"):
                 if h in resp.headers:
                     value = resp.headers[h]
-                    if h == "location":
-                        value = value.replace(f"http://{mirror_host}", f"https://{parsed.hostname}")
-                        value = value.replace(f"https://{mirror_host}", f"https://{parsed.hostname}")
                     resp_headers += f"{h}: {value}\r\n"
+
+            if location and 300 <= resp.status_code < 400 and not hidden_external_redirect:
+                rewritten = location.replace(f"http://{mirror_host}", f"https://{parsed.hostname}")
+                rewritten = rewritten.replace(f"https://{mirror_host}", f"https://{parsed.hostname}")
+                resp_headers += f"location: {rewritten}\r\n"
             resp_headers += "Content-Length: 0\r\n"
             resp_headers += "Connection: close\r\n\r\n"
-            writer.write((f"HTTP/1.1 {resp.status_code} {status_text}\r\n" + resp_headers).encode())
+            response_bytes = (f"HTTP/1.1 {status_code} {status_text}\r\n" + resp_headers).encode()
+            log.info(f"[CONNECT-MITM] HEAD writing response status={status_code} bytes={len(response_bytes)}")
+            writer.write(response_bytes)
+            log.info(f"[CONNECT-MITM] HEAD writer.drain start status={status_code}")
             await writer.drain()
-            log.info(f"[CONNECT-MITM] HEAD {url} via {mirror_host} -> {resp.status_code}")
+            log.info(f"[CONNECT-MITM] HEAD writer.drain done status={status_code}")
+            log.info(
+                f"[CONNECT-MITM] HEAD {url} via {mirror_host} -> upstream={resp.status_code}, sent={status_code}; "
+                f"upstream_location={location!r}; hidden_external_redirect={hidden_external_redirect}; fake_location={fake_location if hidden_external_redirect else None}"
+            )
             return
 
         gw_headers = {}
@@ -459,8 +508,12 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
             resp_headers += "Connection: close\r\n"
             resp_headers += "\r\n"
 
-            writer.write((resp_line + resp_headers).encode())
+            response_head = (resp_line + resp_headers).encode()
+            log.info(f"[CONNECT-MITM] GET writing response head bytes={len(response_head)} status={status_code}")
+            writer.write(response_head)
+            log.info(f"[CONNECT-MITM] GET writer.drain start (headers) status={status_code}")
             await writer.drain()
+            log.info(f"[CONNECT-MITM] GET writer.drain done (headers) status={status_code}")
 
             total_sent = 0
             async for chunk in gw_resp.aiter_bytes(65536):
@@ -468,7 +521,9 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
                 await writer.drain()
                 total_sent += len(chunk)
 
+            log.info(f"[CONNECT-MITM] GET final writer.drain start total_sent={total_sent}")
             await writer.drain()
+            log.info(f"[CONNECT-MITM] GET final writer.drain done total_sent={total_sent}")
             log.info(f"[CONNECT-MITM] Delivered {total_sent / 1e6:.1f} MB for {url}")
 
 
