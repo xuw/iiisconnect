@@ -25,8 +25,8 @@ spec:
           set -e
           export http_proxy=http://192.168.3.226:7890
           export https_proxy=http://192.168.3.226:7890
-          pip install fastapi uvicorn[standard] websockets httpx aiofiles --break-system-packages -q 2>/dev/null || \
-          pip install fastapi uvicorn[standard] websockets httpx aiofiles -q
+          pip install fastapi uvicorn[standard] websockets httpx aiofiles cryptography --break-system-packages -q 2>/dev/null || \
+          pip install fastapi uvicorn[standard] websockets httpx aiofiles cryptography -q
           unset http_proxy https_proxy
           cd /data/repos/iiisconnect
           # Start HTTP proxy (port 3128) in background

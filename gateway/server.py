@@ -256,6 +256,7 @@ async def startup():
 # ---- Health ----
 @app.get("/health")
 async def health():
+    ca_cert_path = os.getenv("IIISCONNECT_CA_CERT_PATH", "/data/iiisconnect-ca.pem")
     return {
         "status": "ok",
         "agent_connected": agent_ws is not None,
@@ -263,6 +264,7 @@ async def health():
         "cache_entries": len(cache_index),
         "cache_size_gb": round(sum(e.get("size", 0) for e in cache_index.values()) / (1024**3), 2),
         "active_tasks": sum(1 for t in tasks.values() if t.status not in ("completed", "failed")),
+        "mitm_ca_cert": ca_cert_path if os.path.exists(ca_cert_path) else None,
     }
 
 
