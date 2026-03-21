@@ -391,84 +391,47 @@ async def _serve_mitm_requests(host: str, reader: asyncio.StreamReader, writer: 
 
 
 async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: asyncio.StreamWriter):
-    """Fetch a URL via the gateway /fetch API and write the HTTP response.
-    
-    For HEAD requests, we do the same fetch but only return headers (no body).
-    For GET requests to accelerated domains, uses the pipeline + cache path.
-    For other URLs, falls back to direct HTTP fetch via the mirror.
-    """
-    is_head = method.upper() == "HEAD"
-    
-    # For HEAD requests, we can't use /fetch (it streams the body).
-    # Instead, do a direct HTTP request to the mirror URL via the agent tunnel,
-    # or use httpx to the mirror directly (agent/iiis can reach hf-mirror).
-    # Actually, the simplest: rewrite to HTTP mirror URL and do HEAD there.
-    from urllib.parse import urlparse
+    """Fetch a URL via the gateway /fetch API and write the HTTP response."""
     parsed = urlparse(url)
-    mirror_host = TUNNEL_REWRITE.get(parsed.hostname, parsed.hostname)
-    mirror_url = f"http://{mirror_host}{parsed.path}"
-    if parsed.query:
-        mirror_url += f"?{parsed.query}"
-    
-    if is_head:
-        # HEAD request: proxy through agent tunnel via HTTP to the mirror.
-        # We open a TCP tunnel to mirror_host:80 via the agent, send the
-        # HEAD request as plain HTTP, and forward the response back.
-        try:
-            ws = await asyncio.wait_for(open_agent_tunnel(mirror_host, 80), timeout=15)
-        except Exception as e:
-            raise Exception(f"Agent tunnel for HEAD failed: {e}")
+    req_method = method.upper()
 
-        # Build HTTP HEAD request
-        head_path = parsed.path or "/"
-        if parsed.query:
-            head_path += f"?{parsed.query}"
-        head_req = f"HEAD {head_path} HTTP/1.1\r\nHost: {mirror_host}\r\n"
-        # Forward important request headers
-        for h in ("accept", "user-agent", "if-none-match", "if-modified-since",
-                   "authorization"):
-            if h in headers:
-                head_req += f"{h}: {headers[h]}\r\n"
-        head_req += "Connection: close\r\n\r\n"
-        
-        await ws.send(head_req.encode())
-        
-        # Read the full response from the WebSocket
-        response_data = b""
-        try:
-            async for msg in ws:
-                if isinstance(msg, bytes):
-                    response_data += msg
-                else:
-                    response_data += msg.encode()
-        except Exception:
-            pass
-        
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-        if not response_data:
-            raise Exception("Empty response from agent tunnel for HEAD")
-        
-        # Forward the raw HTTP response to the client
-        # But rewrite any Location headers that point to the mirror back to the original
-        resp_text = response_data.decode(errors="replace")
-        # Replace mirror host references back to original in Location headers
-        resp_text = resp_text.replace(f"http://{mirror_host}", f"https://{parsed.hostname}")
-        resp_text = resp_text.replace(f"https://{mirror_host}", f"https://{parsed.hostname}")
-        
-        writer.write(resp_text.encode())
-        await writer.drain()
-        log.info(f"[CONNECT-MITM] HEAD {url} proxied via {mirror_host}")
-        return
-
-    # GET request: use gateway /fetch for pipeline + cache
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(1800, connect=30),
         follow_redirects=True,
     ) as client:
+        if req_method == "HEAD":
+            mirror_host = TUNNEL_REWRITE.get(parsed.hostname, parsed.hostname)
+            mirror_url = f"http://{mirror_host}{parsed.path or '/'}"
+            if parsed.query:
+                mirror_url += f"?{parsed.query}"
+
+            req_headers = {"host": parsed.hostname}
+            for h in ("accept", "user-agent", "if-none-match", "if-modified-since", "authorization"):
+                if h in headers:
+                    req_headers[h] = headers[h]
+
+            resp = await client.request("HEAD", mirror_url, headers=req_headers, follow_redirects=True)
+            status_text = {200: "OK", 206: "Partial Content", 301: "Moved Permanently",
+                           302: "Found", 303: "See Other", 304: "Not Modified",
+                           307: "Temporary Redirect", 308: "Permanent Redirect",
+                           404: "Not Found"}.get(resp.status_code, "OK")
+            resp_headers = ""
+            for h in ("content-length", "content-type", "location", "etag", "x-linked-etag",
+                      "x-linked-size", "x-repo-commit", "accept-ranges", "date", "server",
+                      "content-disposition", "cache-control", "last-modified"):
+                if h in resp.headers:
+                    value = resp.headers[h]
+                    if h == "location":
+                        value = value.replace(f"http://{mirror_host}", f"https://{parsed.hostname}")
+                        value = value.replace(f"https://{mirror_host}", f"https://{parsed.hostname}")
+                    resp_headers += f"{h}: {value}\r\n"
+            resp_headers += "Content-Length: 0\r\n"
+            resp_headers += "Connection: close\r\n\r\n"
+            writer.write((f"HTTP/1.1 {resp.status_code} {status_text}\r\n" + resp_headers).encode())
+            await writer.drain()
+            log.info(f"[CONNECT-MITM] HEAD {url} via {mirror_host} -> {resp.status_code}")
+            return
+
         gw_headers = {}
         for h in ("range", "if-none-match", "if-modified-since", "accept", "accept-encoding"):
             if h in headers:
@@ -482,7 +445,7 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
 
             status_code = gw_resp.status_code
             status_text = {200: "OK", 206: "Partial Content", 304: "Not Modified",
-                          404: "Not Found"}.get(status_code, "OK")
+                           404: "Not Found"}.get(status_code, "OK")
 
             resp_line = f"HTTP/1.1 {status_code} {status_text}\r\n"
             resp_headers = ""
@@ -493,7 +456,7 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
             resp_headers += f"Content-Type: {content_type}\r\n"
             if "content-disposition" in gw_resp.headers:
                 resp_headers += f"Content-Disposition: {gw_resp.headers['content-disposition']}\r\n"
-            resp_headers += "Connection: keep-alive\r\n"
+            resp_headers += "Connection: close\r\n"
             resp_headers += "\r\n"
 
             writer.write((resp_line + resp_headers).encode())
@@ -505,6 +468,7 @@ async def _mitm_fetch_via_gateway(url: str, method: str, headers: dict, writer: 
                 await writer.drain()
                 total_sent += len(chunk)
 
+            await writer.drain()
             log.info(f"[CONNECT-MITM] Delivered {total_sent / 1e6:.1f} MB for {url}")
 
 

@@ -73,6 +73,6 @@ spec:
       volumes:
       - name: gpfshome
         persistentVolumeClaim:
-          claimName: pvc-gpfshome-weixu
+          claimName: gfs-nvme-pvc-share-weixu
       imagePullSecrets:
       - name: harbor-xa-registry
